@@ -3,36 +3,20 @@ import re
 import argparse
 from typing import List, Tuple, Union, Dict, Any
 
+
 # ---------- Лексический анализатор ----------
 class Token:
     def __init__(self, type: str, value: str, line: int, col: int):
         self.type = type
         self.value = value
         self.line = line
-        self.col = col
+        self.col = int(col)
 
     def __repr__(self):
         return f"Token({self.type}, '{self.value}', {self.line}:{self.col})"
 
-class Lexer:
-    patterns = [
-        (r'array\(', 'ARRAY_OPEN'),
-        (r'\)', 'ARRAY_CLOSE'),
-        (r',', 'COMMA'),
-        (r'is', 'IS'),
-        (r'\|', 'PIPE_OPEN'),
-        (r'\|', 'PIPE_CLOSE'),
-        (r'\+', 'PLUS'),
-        (r'-', 'MINUS'),
-        (r'\*', 'MULTIPLY'),
-        (r'sort\(', 'SORT'),
-        (r'\d+\.\d*|\.\d+', 'NUMBER'),
-        (r'\d+', 'NUMBER'),
-        (r'[_a-zA-Z][_a-zA-Z0-9]*', 'NAME'),
-        (r'#.*', 'COMMENT'),
-        (r'\s+', 'WHITESPACE'),
-    ]
 
+class Lexer:
     def __init__(self, text: str):
         self.text = text
         self.pos = 0
@@ -41,30 +25,57 @@ class Lexer:
         self.tokens = []
 
     def tokenize(self) -> List[Token]:
-        while self.pos < len(self.text):
-            matched = False
-            for pattern, token_type in self.patterns:
-                regex = re.compile(pattern)
-                match = regex.match(self.text, self.pos)
-                if match:
-                    value = match.group(0)
-                    start_pos = self.pos
-                    self.pos = match.end()
-                    if token_type not in ('WHITESPACE', 'COMMENT'):
-                        token = Token(token_type, value, self.line, start_pos)
-                        self.tokens.append(token)
-                    # Обновляем строку и столбец
-                    lines = value.count('\n')
-                    if lines:
-                        self.line += lines
-                        self.col = 1 + (self.pos - self.text.rfind('\n', 0, self.pos))
-                    else:
-                        self.col += len(value)
-                    matched = True
-                    break
-            if not matched:
-                raise SyntaxError(f"Неизвестный символ '{self.text[self.pos]}' на позиции {self.pos}")
+        token_specs = [
+            ('NUMBER', r'\d+(\.\d*)?|\.\d+'),
+            ('ARRAY_OPEN', r'array\('),
+            ('PAREN_CLOSE', r'\)'),  # Общая закрывающая скобка
+            ('COMMA', r','),
+            ('IS', r'is'),
+            ('PIPE_OPEN', r'\|'),
+            ('PIPE_CLOSE', r'\|'),
+            ('PLUS', r'\+'),
+            ('MINUS', r'-'),
+            ('MULTIPLY', r'\*'),
+            ('SORT', r'sort\('),
+            ('NAME', r'[_a-zA-Z][_a-zA-Z0-9]*'),
+            ('COMMENT', r'#.*'),
+            ('WHITESPACE', r'\s+'),
+            ('MISMATCH', r'.'),
+        ]
+
+        tok_regex = '|'.join(f'(?P<{name}>{pattern})' for name, pattern in token_specs)
+
+        for mo in re.finditer(tok_regex, self.text):
+            kind = mo.lastgroup
+            value = mo.group()
+            col = mo.start() - self.text.rfind('\n', 0, mo.start()) - 1
+            col = max(col, 0) + 1
+
+            if kind == 'WHITESPACE':
+                self.line += value.count('\n')
+                continue
+            elif kind == 'COMMENT':
+                self.line += value.count('\n')
+                continue
+            elif kind == 'MISMATCH':
+                raise SyntaxError(f"Неизвестный символ '{value}' на строке {self.line}, позиция {col}")
+
+            # Определяем PIPE_OPEN или PIPE_CLOSE
+            if kind == 'PIPE_OPEN' or kind == 'PIPE_CLOSE':
+                open_pipes = len([t for t in self.tokens if t.type == 'PIPE_OPEN'])
+                close_pipes = len([t for t in self.tokens if t.type == 'PIPE_CLOSE'])
+                if open_pipes <= close_pipes:
+                    kind = 'PIPE_OPEN'
+                else:
+                    kind = 'PIPE_CLOSE'
+
+            token = Token(kind, value, self.line, col)
+            self.tokens.append(token)
+
+            self.line += value.count('\n')
+
         return self.tokens
+
 
 # ---------- Синтаксический анализатор ----------
 class Parser:
@@ -74,7 +85,7 @@ class Parser:
         self.constants: Dict[str, Any] = {}
         self.output = {}
 
-    def current_token(self) -> Token:
+    def current_token(self) -> Union[Token, None]:
         if self.pos < len(self.tokens):
             return self.tokens[self.pos]
         return None
@@ -84,7 +95,10 @@ class Parser:
         if token and token.type == token_type:
             self.pos += 1
             return token
-        raise SyntaxError(f"Ожидался {token_type}, получен {token.type if token else 'EOF'} на строке {token.line if token else '?'}")
+        if token:
+            raise SyntaxError(f"Ожидался {token_type}, получен {token.type} на строке {token.line}:{token.col}")
+        else:
+            raise SyntaxError(f"Ожидался {token_type}, получен EOF")
 
     def parse(self) -> Dict[str, Any]:
         while self.current_token():
@@ -93,19 +107,22 @@ class Parser:
                 if self.current_token() and self.current_token().type == 'IS':
                     self.eat('IS')
                     value = self.parse_value()
-                    self.constants[name_token.value] = value
+                    # Первые объявления считаем константами
+                    if name_token.value not in self.output:
+                        self.constants[name_token.value] = value
+                    self.output[name_token.value] = value
                 else:
-                    # Это ключ для выходного YAML
-                    key = name_token.value
-                    self.eat('IS')
-                    value = self.parse_value()
-                    self.output[key] = value
+                    raise SyntaxError(f"Ожидалось 'is' после имени на строке {name_token.line}:{name_token.col}")
             else:
-                raise SyntaxError(f"Неожиданный токен {self.current_token().type}")
+                token = self.current_token()
+                raise SyntaxError(f"Неожиданный токен {token.type} на строке {token.line}:{token.col}")
         return self.output
 
     def parse_value(self) -> Any:
         token = self.current_token()
+        if not token:
+            raise SyntaxError("Ожидалось значение, получен EOF")
+
         if token.type == 'NUMBER':
             self.eat('NUMBER')
             if '.' in token.value:
@@ -119,49 +136,86 @@ class Parser:
             name = self.eat('NAME').value
             if name in self.constants:
                 return self.constants[name]
-            raise NameError(f"Константа '{name}' не определена")
+            elif name in self.output:
+                return self.output[name]
+            raise NameError(f"Константа '{name}' не определена на строке {token.line}:{token.col}")
         else:
-            raise SyntaxError(f"Неверное значение на токене {token.type}")
+            raise SyntaxError(
+                f"Неверное значение: ожидалось число, массив или выражение, получен {token.type} на строке {token.line}:{token.col}")
 
     def parse_array(self) -> List[Any]:
         self.eat('ARRAY_OPEN')
         arr = []
-        first = True
-        while self.current_token() and self.current_token().type != 'ARRAY_CLOSE':
-            if not first:
-                self.eat('COMMA')
+
+        if self.current_token() and self.current_token().type == 'PAREN_CLOSE':
+            self.eat('PAREN_CLOSE')
+            return arr
+
+        arr.append(self.parse_value())
+
+        while self.current_token() and self.current_token().type == 'COMMA':
+            self.eat('COMMA')
             arr.append(self.parse_value())
-            first = False
-        self.eat('ARRAY_CLOSE')
+
+        self.eat('PAREN_CLOSE')
         return arr
 
     def parse_constant_expr(self) -> Any:
         self.eat('PIPE_OPEN')
-        # Простое выражение: NAME оператор NAME/NUMBER
-        left = self.parse_value()
+
+        # Смотрим, что идет после |
         token = self.current_token()
-        if token.type in ('PLUS', 'MINUS', 'MULTIPLY'):
-            op = token.type
-            self.eat(token.type)
-            right = self.parse_value()
-            if op == 'PLUS':
-                result = left + right
-            elif op == 'MINUS':
-                result = left - right
-            elif op == 'MULTIPLY':
-                result = left * right
-        elif token.type == 'SORT':
-            self.eat('SORT')
-            # sort() применяется к массиву
-            if not isinstance(left, list):
-                raise TypeError("sort() ожидает массив")
-            result = sorted(left)
+        if not token:
+            raise SyntaxError("Незавершенное выражение в | |")
+
+        # Если сразу идет sort, это вызов функции
+        if token.type == 'SORT':
+            return self.parse_sort_function()
+
+        # Иначе парсим выражение
+        left = self.parse_value()
+
+        token = self.current_token()
+        if not token:
+            raise SyntaxError("Незавершенное выражение в | |")
+
+        if token.type == 'PIPE_CLOSE':
+            # Просто значение в скобках
             self.eat('PIPE_CLOSE')
-            return result
+            return left
+
+        elif token.type in ('PLUS', 'MINUS', 'MULTIPLY'):
+            # Бинарная операция
+            op_token = self.eat(token.type)
+            right = self.parse_value()
+            self.eat('PIPE_CLOSE')
+
+            if op_token.type == 'PLUS':
+                return left + right
+            elif op_token.type == 'MINUS':
+                return left - right
+            elif op_token.type == 'MULTIPLY':
+                return left * right
         else:
-            result = left
+            raise SyntaxError(f"Неизвестный оператор {token.type} в выражении на строке {token.line}:{token.col}")
+
+    def parse_sort_function(self) -> Any:
+        """Парсит выражение sort(выражение)"""
+        self.eat('SORT')  # eat 'sort('
+
+        # Парсим аргумент функции
+        arg = self.parse_value()
+
+        # Закрывающая скобка функции sort()
+        self.eat('PAREN_CLOSE')
+
+        # Проверяем, что аргумент - массив
+        if not isinstance(arg, list):
+            raise TypeError(f"sort() ожидает массив, получен {type(arg).__name__}")
+
         self.eat('PIPE_CLOSE')
-        return result
+        return sorted(arg)
+
 
 # ---------- Преобразование в YAML ----------
 def dict_to_yaml(data: Dict[str, Any], indent=0) -> str:
@@ -182,10 +236,11 @@ def dict_to_yaml(data: Dict[str, Any], indent=0) -> str:
             yaml_lines.append(f"{'  ' * indent}{key}: {value}")
     return "\n".join(yaml_lines)
 
+
 # ---------- Основная программа ----------
 def main():
     parser = argparse.ArgumentParser(description="Конвертер учебного конфигурационного языка в YAML")
-    parser.add_argument("input_file.config", help="Путь к входному файлу")
+    parser.add_argument("input_file", help="Путь к входному файлу")
     args = parser.parse_args()
 
     try:
@@ -205,6 +260,7 @@ def main():
     except (SyntaxError, NameError, TypeError) as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
